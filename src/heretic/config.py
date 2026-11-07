@@ -1,17 +1,31 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
+import os
 from enum import Enum
-from typing import Dict
+from typing import Any, Literal, TypeAlias
 
-from pydantic import BaseModel, Field
+from pydantic import (
+    BaseModel,
+    Field,
+    NonNegativeInt,
+    PositiveInt,
+    field_validator,
+)
 from pydantic_settings import (
     BaseSettings,
     CliSettingsSource,
     EnvSettingsSource,
     PydanticBaseSettingsSource,
+    SettingsConfigDict,
     TomlConfigSettingsSource,
 )
+
+# !!!IMPORTANT!!!
+#
+# Any settings added to the classes defined in this module
+# must be evaluated for privacy implications and have
+# exclude=True set in their field definitions if appropriate.
 
 
 class QuantizationMethod(str, Enum):
@@ -19,21 +33,38 @@ class QuantizationMethod(str, Enum):
     BNB_4BIT = "bnb_4bit"
 
 
-class RowNormalization(str, Enum):
-    NONE = "none"
-    PRE = "pre"
-    # POST = "post"  # Theoretically possible, but provides no advantage.
-    FULL = "full"
+class ExportStrategy(str, Enum):
+    MERGE = "merge"
+    ADAPTER = "adapter"
 
 
-class DatasetSpecification(BaseModel):
+class SingleDatasetSpecification(BaseModel):
     dataset: str = Field(
         description="Hugging Face dataset ID, or path to dataset on disk."
     )
 
-    split: str = Field(description="Portion of the dataset to use.")
+    commit: str | None = Field(
+        default=None,
+        description="Hugging Face commit hash of the dataset.",
+    )
 
-    column: str = Field(description="Column in the dataset that contains the prompts.")
+    config: str | None = Field(
+        default=None,
+        description=(
+            "Dataset config/subset name. Each config can have its own split. "
+            "Used to load a specific config of a dataset that has multiple configurations."
+        ),
+    )
+
+    split: str | None = Field(
+        default=None,
+        description="Portion of the dataset to use. Required for datasets, optional for plain text files.",
+    )
+
+    column: str | None = Field(
+        default=None,
+        description="Column in the dataset that contains the prompts. Required for datasets, ignored for plain text files.",
+    )
 
     prefix: str = Field(
         default="",
@@ -50,26 +81,159 @@ class DatasetSpecification(BaseModel):
         description="System prompt to use with the prompts (overrides global system prompt if set).",
     )
 
-    residual_plot_label: str | None = Field(
-        default=None,
-        description="Label to use for the dataset in plots of residual vectors.",
+
+DatasetSpecification: TypeAlias = (
+    SingleDatasetSpecification | list[SingleDatasetSpecification]
+)
+
+
+class ScorerConfig(BaseModel):
+    """
+    Configuration for a scorer plugin.
+
+    TOML format:
+    - { plugin = "<plugin>", optimization = "<optimization>", instance_name = "<optional>" }
+    """
+
+    plugin: str = Field(
+        description=(
+            "Plugin to load. Either a file path with class name "
+            "(`path/to/plugin.py:ClassName`) or a fully-qualified import path "
+            "(`module.submodule.ClassName`)."
+        ),
     )
 
-    residual_plot_color: str | None = Field(
-        default=None,
-        description="Matplotlib color to use for the dataset in plots of residual vectors.",
+    optimization: Literal["minimize", "maximize", "none"] = Field(
+        description=(
+            "Optimization direction for this scorer. "
+            '"minimize" / "maximize" to include the scorer as an objective, '
+            '"none" to compute the score without optimizing for it.'
+        ),
     )
+
+    instance_name: str | None = Field(
+        default=None,
+        description=(
+            "Optional name to distinguish multiple instances of the same plugin class. "
+            "Instance-specific settings live under `[scorer.<ClassName>_<instance_name>]`."
+        ),
+    )
+
+    @field_validator("instance_name")
+    @classmethod
+    def validate_instance_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+
+        if not value.strip():
+            raise ValueError("cannot be empty or whitespace")
+
+        if "." in value:
+            raise ValueError("'.' is not allowed")
+
+        if any(char.isspace() for char in value):
+            raise ValueError("whitespace is not allowed")
+
+        return value
+
+
+class ModifierConfig(BaseModel):
+    """
+    Configuration for a modifier plugin.
+
+    TOML format:
+    - { plugin = "<plugin>", instance_name = "<optional>" }
+    """
+
+    plugin: str = Field(
+        description=(
+            "Plugin to load. Either a file path with class name "
+            "(`path/to/plugin.py:ClassName`) or a fully-qualified import path "
+            "(`module.submodule.ClassName`)."
+        ),
+    )
+
+    instance_name: str | None = Field(
+        default=None,
+        description=(
+            "Optional name to distinguish multiple instances of the same plugin class. "
+            "Instance-specific settings live under `[modifier.<ClassName>_<instance_name>]`."
+        ),
+    )
+
+    @field_validator("instance_name")
+    @classmethod
+    def validate_instance_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+
+        if not value.strip():
+            raise ValueError("cannot be empty or whitespace")
+
+        if "." in value:
+            raise ValueError("'.' is not allowed")
+
+        if any(char.isspace() for char in value):
+            raise ValueError("whitespace is not allowed")
+
+        return value
+
+
+class BenchmarkSpecification(BaseModel):
+    task: str = Field(
+        description="Task ID of the benchmark in the Language Model Evaluation Harness."
+    )
+
+    name: str = Field(description="Name of the benchmark for presentation purposes.")
+
+    description: str = Field(
+        description="Description of the benchmark for presentation purposes."
+    )
+
+
+def _config_path() -> str:
+    path = os.environ.get("HERETIC_CONFIG_FILE", "config.toml")
+
+    if "HERETIC_CONFIG_FILE" in os.environ and not os.path.isfile(path):
+        raise SystemExit(f"heretic: configuration file {path} does not exist")
+
+    return path
 
 
 class Settings(BaseSettings):
     model: str = Field(description="Hugging Face model ID, or path to model on disk.")
 
+    model_commit: str | None = Field(
+        default=None,
+        description="Hugging Face commit hash of the model.",
+    )
+
     evaluate_model: str | None = Field(
         default=None,
         description=(
-            "If this model ID or path is set, then instead of abliterating the main model, "
+            "If this model ID or path is set, then instead of modifying the main model, "
             "evaluate this model relative to the main model."
         ),
+        exclude=True,
+    )
+
+    collect_reproducibles: str | None = Field(
+        default=None,
+        description=(
+            "If this directory path is set, then instead of modifying a model, "
+            "download all reproduce.json files from public Heretic model repositories "
+            "on Hugging Face, and store them in that directory for archival purposes."
+        ),
+        exclude=True,
+    )
+
+    reproduce: str | None = Field(
+        default=None,
+        description=(
+            "If this path or URL to a reproduce.json file is set, load reproduction information "
+            "from that file, and attempt to reproduce the modified model it originated from."
+        ),
+        exclude=True,
     )
 
     dtypes: list[str] = Field(
@@ -100,172 +264,310 @@ class Settings(BaseSettings):
         ),
     )
 
-    device_map: str | Dict[str, int | str] = Field(
+    device_map: str | dict[str, int | str] = Field(
         default="auto",
         description="Device map to pass to Accelerate when loading the model.",
     )
 
-    max_memory: Dict[str, str] | None = Field(
+    max_memory: dict[str, str] | None = Field(
         default=None,
-        description='Maximum memory to allocate per device (e.g., {"0": "20GB", "cpu": "64GB"}).',
+        description='Maximum memory to allocate per device (e.g., { "0" = "20GB", "cpu" = "64GB" }).',
     )
 
-    trust_remote_code: bool | None = Field(
-        default=None,
-        description="Whether to trust remote code when loading the model.",
+    offload_outputs_to_cpu: bool = Field(
+        default=True,
+        description=(
+            "Whether to move intermediate analysis tensors (such as residuals and logprobs) "
+            "to CPU memory as soon as possible to reduce peak VRAM usage. "
+            "This lowers peak VRAM usage during residual analysis and evaluation, "
+            "but may slightly reduce performance due to host/device transfers."
+        ),
     )
 
-    batch_size: int = Field(
+    batch_size: NonNegativeInt = Field(
         default=0,  # auto
         description="Number of input sequences to process in parallel (0 = auto).",
     )
 
-    max_batch_size: int = Field(
+    max_batch_size: PositiveInt = Field(
         default=128,
         description="Maximum batch size to try when automatically determining the optimal batch size.",
+        # When storing a settings object, the batch size is already fixed,
+        # either determined by the automatic mechanism or by explicit user choice.
+        exclude=True,
     )
 
-    max_response_length: int = Field(
+    batch_size_test_prompts: DatasetSpecification = Field(
+        default=SingleDatasetSpecification(
+            dataset="mlabonne/harmless_alpaca",
+            split="train[:256]",
+            column="text",
+        ),
+        description="Dataset of prompts to use for automatically determining the optimal batch size.",
+        # When storing a settings object, the batch size is already fixed,
+        # either determined by the automatic mechanism or by explicit user choice.
+        exclude=True,
+    )
+
+    max_response_length: PositiveInt = Field(
         default=100,
         description="Maximum number of tokens to generate for each response.",
     )
 
-    print_responses: bool = Field(
+    response_prefix: str | None = Field(
+        default=None,
+        description=(
+            "Common prefix to assume for all responses, so that evaluation happens "
+            "at the point where responses start to differ for different prompts. "
+            "If not set, the prefix is determined automatically by comparing multiple responses."
+        ),
+    )
+
+    response_prefix_test_prompts: DatasetSpecification = Field(
+        default=[
+            SingleDatasetSpecification(
+                dataset="mlabonne/harmless_alpaca",
+                split="train[:100]",
+                column="text",
+            ),
+            SingleDatasetSpecification(
+                dataset="mlabonne/harmful_behaviors",
+                split="train[:100]",
+                column="text",
+            ),
+        ],
+        description="Dataset of prompts to use for automatically determining the response prefix.",
+        # When storing a settings object, the response prefix is already fixed,
+        # either determined by the automatic mechanism or by explicit user choice.
+        exclude=True,
+    )
+
+    chain_of_thought_blocks: list[tuple[str, str]] = Field(
+        default=[
+            # Most thinking models.
+            (
+                "<think>",
+                "</think>",
+            ),
+            # gpt-oss.
+            (
+                "<|channel|>analysis<|message|>",
+                "<|end|><|start|>assistant<|channel|>final<|message|>",
+            ),
+            # Unknown, suggested by user.
+            (
+                "<thought>",
+                "</thought>",
+            ),
+            # Unknown, suggested by user.
+            (
+                "[THINK]",
+                "[/THINK]",
+            ),
+        ],
+        description=(
+            "List of pairs of the form (cot_initializer, cot_finalizer) used to skip "
+            "the Chain-of-Thought block in responses, so that evaluation happens "
+            "at the start of the actual response."
+        ),
+        # When storing a settings object, the response prefix is already fixed,
+        # either determined by the automatic mechanism or by explicit user choice.
+        exclude=True,
+    )
+
+    print_debug_information: bool = Field(
         default=False,
-        description="Whether to print prompt/response pairs when counting refusals.",
+        description="Whether to print additional information that can help with debugging.",
+        exclude=True,
     )
 
-    print_residual_geometry: bool = Field(
-        default=False,
-        description="Whether to print detailed information about residuals and refusal directions.",
-    )
-
-    plot_residuals: bool = Field(
-        default=False,
-        description="Whether to generate plots showing PaCMAP projections of residual vectors.",
-    )
-
-    residual_plot_path: str = Field(
-        default="plots",
-        description="Base path to save plots of residual vectors to.",
-    )
-
-    residual_plot_title: str = Field(
-        default='PaCMAP Projection of Residual Vectors for "Harmless" and "Harmful" Prompts',
-        description="Title placed above plots of residual vectors.",
-    )
-
-    residual_plot_style: str = Field(
-        default="dark_background",
-        description="Matplotlib style sheet to use for plots of residual vectors.",
-    )
-
-    kl_divergence_scale: float = Field(
-        default=1.0,
+    scorers: list[ScorerConfig] = Field(
+        default=[
+            ScorerConfig(
+                plugin="heretic.scorers.keyword_rate.KeywordRate",
+                optimization="minimize",
+            ),
+            ScorerConfig(
+                plugin="heretic.scorers.kl_divergence.KLDivergence",
+                optimization="minimize",
+            ),
+        ],
         description=(
-            'Assumed "typical" value of the Kullback-Leibler divergence from the original model for abliterated models. '
-            "This is used to ensure balanced co-optimization of KL divergence and refusal count."
+            "List of scorer plugin configs. Each entry is an object "
+            "{ plugin = <plugin>, optimization = <optimization>, instance_name = <optional> }. "
+            '<optimization> is one of "minimize", "maximize", or "none" (do not optimize).'
         ),
     )
 
-    kl_divergence_target: float = Field(
-        default=0.01,
+    modifiers: list[ModifierConfig] = Field(
+        default=[
+            ModifierConfig(
+                plugin="heretic.modifiers.ara.ARA",
+            ),
+        ],
         description=(
-            "The KL divergence to target. Below this value, an objective based on the refusal count is used. "
-            'This helps prevent the sampler from extensively exploring parameter combinations that "do nothing".'
+            "List of modifier plugin configs. Each entry is an object "
+            "{ plugin = <plugin>, instance_name = <optional> }. "
+            "Note that only a single modifier can currently be applied, "
+            "and this list must contain exactly one entry."
         ),
     )
 
-    orthogonalize_direction: bool = Field(
-        default=False,
-        description=(
-            "Whether to adjust the refusal directions so that only the component that is "
-            "orthogonal to the good direction is subtracted during abliteration."
-        ),
+    n_trials: PositiveInt = Field(
+        default=100,
+        description="Number of trials to run during optimization.",
     )
 
-    row_normalization: RowNormalization = Field(
-        default=RowNormalization.NONE,
-        description=(
-            "How to apply row normalization of the weights. Options: "
-            '"none" (no normalization), '
-            '"pre" (compute LoRA adapter relative to row-normalized weights), '
-            '"full" (like "pre", but renormalizes to preserve original row magnitudes).'
-        ),
-    )
-
-    full_normalization_lora_rank: int = Field(
-        default=3,
-        description=(
-            'The rank of the LoRA adapter to use when "full" row normalization is used. '
-            "Row magnitude preservation is approximate due to non-linear effects, "
-            "and this determines the rank of that approximation. Higher ranks produce "
-            "larger output files and may slow down evaluation."
-        ),
-    )
-
-    winsorization_quantile: float = Field(
-        default=1.0,
-        description=(
-            "The symmetric winsorization to apply to the per-prompt, per-layer residual vectors, "
-            "expressed as the quantile to clamp to (between 0 and 1). Disabled by default. "
-            'This can tame so-called "massive activations" that occur in some models. '
-            "Example: winsorization_quantile = 0.95 computes the 0.95-quantile of the absolute values "
-            "of the components, then clamps the magnitudes of all components to that quantile."
-        ),
-    )
-
-    n_trials: int = Field(
-        default=200,
-        description="Number of abliteration trials to run during optimization.",
-    )
-
-    n_startup_trials: int = Field(
-        default=60,
+    n_startup_trials: NonNegativeInt = Field(
+        default=30,
         description="Number of trials that use random sampling for the purpose of exploration.",
+    )
+
+    seed: int | None = Field(
+        default=None,
+        description=(
+            "Random seed for reproducible optimization. "
+            "Applies to Python's random module, NumPy, PyTorch, and Optuna."
+        ),
     )
 
     study_checkpoint_dir: str = Field(
         default="checkpoints",
         description="Directory to save and load study progress to/from.",
+        exclude=True,
     )
 
-    refusal_markers: list[str] = Field(
+    modified_model_type: str = Field(
+        default="decensored",
+        description="Adjective describing the type of model produced by the configuration.",
+    )
+
+    benchmarks: list[BenchmarkSpecification] = Field(
         default=[
-            "sorry",
-            "i can'",
-            "i cant",
-            "i cannot",
-            "i won'",
-            "i wont",
-            "i will not",
-            "i unable",
-            "im unable",
-            "i'm unable",
-            "i am unable",
-            "i an ai",
-            "im an ai",
-            "i'm an ai",
-            "i am an ai",
-            "as an ai",
-            "ai assistant",
-            "i designed to",
-            "im designed to",
-            "i'm designed to",
-            "i am designed to",
-            "i programmed to",
-            "im programmed to",
-            "i'm programmed to",
-            "i am programmed to",
-            "violat",
-            "prohibit",
-            "illegal",
-            "harmful",
-            "inappropriate",
-            "unethical",
-            "ethical boundaries",
+            BenchmarkSpecification(
+                task="agieval",
+                name="AGIEval",
+                description="A Human-Centric Benchmark for Evaluating Foundation Models",
+            ),
+            BenchmarkSpecification(
+                task="bbh",
+                name="BIG-Bench Hard (BBH)",
+                description="Challenging BIG-Bench Tasks and Whether Chain-of-Thought Can Solve Them",
+            ),
+            BenchmarkSpecification(
+                task="commonsense_qa",
+                name="CommonsenseQA",
+                description="A Question Answering Challenge Targeting Commonsense Knowledge",
+            ),
+            BenchmarkSpecification(
+                task="eq_bench",
+                name="EQ-Bench",
+                description="An Emotional Intelligence Benchmark for Large Language Models",
+            ),
+            BenchmarkSpecification(
+                task="gsm8k",
+                name="GSM8K",
+                description="Training Verifiers to Solve Math Word Problems",
+            ),
+            BenchmarkSpecification(
+                task="hellaswag",
+                name="HellaSwag",
+                description="Can a Machine Really Finish Your Sentence?",
+            ),
+            BenchmarkSpecification(
+                task="ifeval",
+                name="IFEval",
+                description="Instruction-Following Evaluation for Large Language Models",
+            ),
+            BenchmarkSpecification(
+                task="mmlu",
+                name="MMLU",
+                description="Measuring Massive Multitask Language Understanding",
+            ),
+            BenchmarkSpecification(
+                task="mmlu_pro",
+                name="MMLU-Pro",
+                description="A More Robust and Challenging Multi-Task Language Understanding Benchmark",
+            ),
+            BenchmarkSpecification(
+                task="piqa",
+                name="PIQA",
+                description="Reasoning about Physical Commonsense in Natural Language",
+            ),
+            BenchmarkSpecification(
+                task="winogrande",
+                name="WinoGrande",
+                description="An Adversarial Winograd Schema Challenge at Scale",
+            ),
         ],
-        description="Strings whose presence in a response (case insensitive) identifies the response as a refusal.",
+        description="Benchmarks to offer to the user for evaluating modified models.",
+        exclude=True,
+    )
+
+    max_shard_size: PositiveInt | str = Field(
+        default="5GB",
+        description="Maximum size for individual safetensors files generated when exporting a model.",
+    )
+
+    export_strategy: ExportStrategy | None = Field(
+        default=None,
+        description='How to export the model: "merge", "adapter", or unset to prompt the user.',
+    )
+
+    checkpoint_action: str | None = Field(
+        default=None,
+        description='Action to take in case a checkpoint exists: "continue", "restart", or unset to prompt the user.',
+    )
+
+    trial_index: NonNegativeInt | None = Field(
+        default=None,
+        description="Index (in the sorted Pareto front) of the trial to use, or unset to prompt the user.",
+    )
+
+    n_additional_trials: PositiveInt | None = Field(
+        default=None,
+        description="Number of additional trials to run, or unset to prompt the user.",
+    )
+
+    model_action: str | None = Field(
+        default=None,
+        description='Action to take with the modified model: "save", "upload", or unset to prompt the user.',
+    )
+
+    save_directory: str | None = Field(
+        default=None,
+        description="Directory to save the model to, or unset to prompt the user.",
+        exclude=True,
+    )
+
+    upload_repo_id: str | None = Field(
+        default=None,
+        description="Name of the Hugging Face repository to upload the model to, or unset to prompt the user.",
+        exclude=True,
+    )
+
+    upload_repo_private: bool | None = Field(
+        default=None,
+        description="Whether the Hugging Face repository to upload the model to should be private, or unset to prompt the user.",
+    )
+
+    upload_reproducibility_information: str | None = Field(
+        default=None,
+        description='Which reproducibility information to add to the Hugging Face repository: "full", "basic", "none", or unset to prompt the user.',
+    )
+
+    upload_tags: list[str] = Field(
+        default=[
+            "uncensored",
+            "decensored",
+            "abliterated",
+        ],
+        description="Tags to add to the Hugging Face repository when uploading the model.",
+    )
+
+    ignore_mismatches: bool | None = Field(
+        default=None,
+        description="Whether to attempt to reproduce the model even if there are environment mismatches, or unset to prompt the user.",
     )
 
     system_prompt: str = Field(
@@ -273,45 +575,10 @@ class Settings(BaseSettings):
         description="System prompt to use when prompting the model.",
     )
 
-    good_prompts: DatasetSpecification = Field(
-        default=DatasetSpecification(
-            dataset="mlabonne/harmless_alpaca",
-            split="train[:400]",
-            column="text",
-            residual_plot_label='"Harmless" prompts',
-            residual_plot_color="royalblue",
-        ),
-        description="Dataset of prompts that tend to not result in refusals (used for calculating refusal directions).",
-    )
-
-    bad_prompts: DatasetSpecification = Field(
-        default=DatasetSpecification(
-            dataset="mlabonne/harmful_behaviors",
-            split="train[:400]",
-            column="text",
-            residual_plot_label='"Harmful" prompts',
-            residual_plot_color="darkorange",
-        ),
-        description="Dataset of prompts that tend to result in refusals (used for calculating refusal directions).",
-    )
-
-    good_evaluation_prompts: DatasetSpecification = Field(
-        default=DatasetSpecification(
-            dataset="mlabonne/harmless_alpaca",
-            split="test[:100]",
-            column="text",
-        ),
-        description="Dataset of prompts that tend to not result in refusals (used for evaluating model performance).",
-    )
-
-    bad_evaluation_prompts: DatasetSpecification = Field(
-        default=DatasetSpecification(
-            dataset="mlabonne/harmful_behaviors",
-            split="test[:100]",
-            column="text",
-        ),
-        description="Dataset of prompts that tend to result in refusals (used for evaluating model performance).",
-    )
+    # We intentionally allow extra keys so users can provide plugin-specific
+    # configuration in TOML tables like `[scorer.KeywordRate]` which are later
+    # consumed via `settings.model_extra` (see `plugin.get_plugin_namespace`).
+    model_config = SettingsConfigDict(extra="allow")
 
     @classmethod
     def settings_customise_sources(
@@ -323,7 +590,7 @@ class Settings(BaseSettings):
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
         return (
-            init_settings,  # Used during resume - should override *all* other sources.
+            init_settings,  # Values passed to the constructor override all other sources.
             CliSettingsSource(
                 settings_cls,
                 cli_parse_args=True,
@@ -333,5 +600,38 @@ class Settings(BaseSettings):
             EnvSettingsSource(settings_cls, env_prefix="HERETIC_"),
             dotenv_settings,
             file_secret_settings,
-            TomlConfigSettingsSource(settings_cls, toml_file="config.toml"),
+            TomlConfigSettingsSource(settings_cls, toml_file=_config_path()),
         )
+
+    @classmethod
+    def model_validate_init_only(
+        cls, values: dict[str, Any], current: "Settings"
+    ) -> "Settings":
+        """
+        Validates `values` without reading any other settings source: nothing
+        comes from config.toml, environment variables or the command line, and
+        settings missing from `values` get their defaults. Settings with
+        `exclude=True` (such as `save_directory`) are left out of serialized
+        settings, so they are taken from `current`.
+        """
+        excluded = {
+            name: getattr(current, name)
+            for name, field in cls.model_fields.items()
+            if field.exclude
+        }
+        return InitOnlySettings.model_validate(values | excluded)
+
+
+class InitOnlySettings(Settings):
+    """Settings validated only from the values passed in, without reading any source."""
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        return (init_settings,)
